@@ -3,6 +3,10 @@
 - `server/cmd/multica/cmd_runtime.go` registers `runtime list`, `usage`, `activity`, and `update`.
 - `runtime list` reads `/api/runtimes` and prints `id`, `name`, `runtime_mode`, `provider`, `status`, and `last_seen_at`.
 - `runtime update` posts to `/api/runtimes/{runtime-id}/update`; with `--wait` it polls update status.
+- `server/cmd/multica/cmd_runtime_repl.go` registers `runtime repl`, `runtime next`, and `runtime result`, and installs the embedded `multica-repl-runtime` skill into `~/.claude/skills/`.
+- `runtime repl` calls `startDaemonForeground(cmd, "repl")` (`server/cmd/multica/cmd_daemon.go`); `--executor` / `MULTICA_RUNTIME_EXECUTOR` resolves `Config.RuntimeExecutor` in `server/internal/daemon/config.go` (`ExecutorSubprocess` default, `ExecutorRepl`).
+- `runtime next` GETs and `runtime result` POSTs the daemon loopback `/runtime/next` and `/runtime/result`, served in `server/internal/daemon/health.go` against the broker in `server/internal/daemon/broker.go`; both 503 unless `RuntimeExecutor == ExecutorRepl`.
+- In repl mode, `server/internal/daemon/daemon.go` runs every provider through the `repl` agent backend (`server/pkg/agent/repl.go`), wiring `agent.Config.ReplBroker`; the daemon still claims, heartbeats, checks out, and completes/fails the task.
 - `server/cmd/multica/cmd_repo.go` registers `repo checkout <url> [--ref]`.
 - `repo checkout` requires `MULTICA_DAEMON_PORT`, sends `workspace_id`, `workdir`, `ref`, `agent_name`, and `task_id` to local daemon `/repo/checkout`, then prints the checked-out path.
 - `server/cmd/server/router.go` registers daemon APIs under `/api/daemon`, including workspace repos and task claim.

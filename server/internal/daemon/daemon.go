@@ -92,6 +92,11 @@ type Daemon struct {
 	repoCache repoCacheBackend
 	logger    *slog.Logger
 
+	// replBroker is non-nil only when RuntimeExecutor is ExecutorRepl. It is the
+	// handoff between the repl agent backend and the human-driven REPL sessions
+	// that claim tasks over the loopback health server.
+	replBroker *replBroker
+
 	mu           sync.Mutex
 	workspaces   map[string]*workspaceState
 	runtimeIndex map[string]Runtime // runtimeID -> Runtime for provider lookups
@@ -188,6 +193,10 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 	}
 	d.runner = taskRunnerFunc(d.runTask)
 	d.runUpdateFn = d.runUpdate
+	if cfg.RuntimeExecutor == ExecutorRepl {
+		d.replBroker = newReplBroker(logger)
+		logger.Info("runtime executor: repl (tasks run in human-launched REPL sessions via the local broker)")
+	}
 	return d
 }
 
@@ -2919,11 +2928,21 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			agentEnv[k] = v
 		}
 	}
-	backend, err := agent.New(provider, agent.Config{
+	// In repl executor mode every provider is run through the repl backend,
+	// which hands the prepared task to the broker for a human REPL session
+	// instead of spawning a subprocess. The provider is still resolved above so
+	// registration, version detection, and model/thinking handling stay intact.
+	backendType := provider
+	agentCfg := agent.Config{
 		ExecutablePath: entry.Path,
 		Env:            agentEnv,
 		Logger:         d.logger,
-	})
+	}
+	if d.cfg.RuntimeExecutor == ExecutorRepl {
+		backendType = "repl"
+		agentCfg.ReplBroker = d.replBroker
+	}
+	backend, err := agent.New(backendType, agentCfg)
 	if err != nil {
 		return TaskResult{}, fmt.Errorf("create agent backend: %w", err)
 	}
@@ -2998,6 +3017,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	execOpts := agent.ExecOptions{
 		Cwd:                       env.WorkDir,
 		Model:                     model,
+		TaskID:                    task.ID,
 		ThreadName:                deriveTaskThreadName(task),
 		Timeout:                   d.cfg.AgentTimeout,
 		SemanticInactivityTimeout: d.cfg.CodexSemanticInactivityTimeout,

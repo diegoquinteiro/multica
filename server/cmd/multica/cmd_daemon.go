@@ -84,6 +84,7 @@ func init() {
 	f.Int("max-concurrent-tasks", 0, "Max tasks running in parallel (env: MULTICA_DAEMON_MAX_CONCURRENT_TASKS)")
 	f.Bool("no-auto-update", false, "Disable periodic CLI self-update (env: MULTICA_DAEMON_AUTO_UPDATE=false)")
 	f.Duration("auto-update-interval", 0, "How often to poll GitHub for a newer release (env: MULTICA_DAEMON_AUTO_UPDATE_INTERVAL)")
+	f.String("executor", "", "Task executor mode: subprocess (default) or repl (env: MULTICA_RUNTIME_EXECUTOR)")
 
 	daemonLogsCmd.Flags().BoolP("follow", "f", false, "Follow log output")
 	daemonLogsCmd.Flags().IntP("lines", "n", 50, "Number of lines to show")
@@ -103,6 +104,7 @@ func init() {
 	rf.Int("max-concurrent-tasks", 0, "Max tasks running in parallel (env: MULTICA_DAEMON_MAX_CONCURRENT_TASKS)")
 	rf.Bool("no-auto-update", false, "Disable periodic CLI self-update (env: MULTICA_DAEMON_AUTO_UPDATE=false)")
 	rf.Duration("auto-update-interval", 0, "How often to poll GitHub for a newer release (env: MULTICA_DAEMON_AUTO_UPDATE_INTERVAL)")
+	rf.String("executor", "", "Task executor mode: subprocess (default) or repl (env: MULTICA_RUNTIME_EXECUTOR)")
 
 	df := daemonDiskUsageCmd.Flags()
 	df.Bool("by-workspace", false, "Aggregate output by workspace instead of by task")
@@ -315,6 +317,9 @@ func buildDaemonStartArgs(cmd *cobra.Command) []string {
 	if d, _ := cmd.Flags().GetDuration("auto-update-interval"); d > 0 {
 		args = append(args, "--auto-update-interval", d.String())
 	}
+	if v := flagString(cmd, "executor"); v != "" {
+		args = append(args, "--executor", v)
+	}
 
 	// Forward global persistent flags.
 	if v, _ := cmd.Flags().GetString("server-url"); v != "" {
@@ -328,6 +333,13 @@ func buildDaemonStartArgs(cmd *cobra.Command) []string {
 }
 
 func runDaemonForeground(cmd *cobra.Command) error {
+	return startDaemonForeground(cmd, "")
+}
+
+// startDaemonForeground runs the daemon in the current process. executorOverride
+// forces the task executor mode (used by `multica runtime repl`); when empty the
+// mode is resolved from the --executor flag / MULTICA_RUNTIME_EXECUTOR / default.
+func startDaemonForeground(cmd *cobra.Command, executorOverride string) error {
 	util.EnsureHiddenConsole()
 
 	profile := resolveProfile(cmd)
@@ -338,13 +350,18 @@ func runDaemonForeground(cmd *cobra.Command) error {
 			serverURL = c.ServerURL
 		}
 	}
+	executor := executorOverride
+	if executor == "" {
+		executor = cli.FlagOrEnv(cmd, "executor", "MULTICA_RUNTIME_EXECUTOR", "")
+	}
 	overrides := daemon.Overrides{
-		ServerURL:   serverURL,
-		DaemonID:    flagString(cmd, "daemon-id"),
-		DeviceName:  flagString(cmd, "device-name"),
-		RuntimeName: flagString(cmd, "runtime-name"),
-		Profile:     profile,
-		HealthPort:  healthPortForProfile(profile),
+		ServerURL:       serverURL,
+		DaemonID:        flagString(cmd, "daemon-id"),
+		DeviceName:      flagString(cmd, "device-name"),
+		RuntimeName:     flagString(cmd, "runtime-name"),
+		Profile:         profile,
+		HealthPort:      healthPortForProfile(profile),
+		RuntimeExecutor: executor,
 	}
 	if d, _ := cmd.Flags().GetDuration("poll-interval"); d > 0 {
 		overrides.PollInterval = d

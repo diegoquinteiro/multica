@@ -62,6 +62,19 @@ const (
 	DefaultAutoUpdateCheckInterval = 6 * time.Hour  // how often the daemon polls GitHub for a newer CLI release
 )
 
+// Runtime executor modes. The executor decides HOW a claimed task is run; the
+// rest of the daemon lifecycle (register, claim, heartbeat, checkout) is
+// identical across modes.
+const (
+	// ExecutorSubprocess is the default: the daemon spawns the provider CLI
+	// (e.g. `claude -p`) as a subprocess per task.
+	ExecutorSubprocess = "subprocess"
+	// ExecutorRepl hands each prepared task to a local broker and waits for a
+	// human-launched Claude Code REPL session to run it on the interactive
+	// subscription quota. See server/pkg/agent/repl.go and broker.go.
+	ExecutorRepl = "repl"
+)
+
 // DefaultGCArtifactPatterns lists basename matches that the GC loop treats as
 // regenerable build artifacts. Kept conservative: only directories that are
 // always cheap to recreate (`pnpm install`, `next build`, `turbo build`). Things
@@ -102,6 +115,10 @@ type Config struct {
 	ClaudeArgs                     []string
 	CodexArgs                      []string
 	CodebuddyArgs                  []string
+	// RuntimeExecutor selects how claimed tasks are executed: ExecutorSubprocess
+	// (default) spawns the provider CLI per task; ExecutorRepl hands tasks to a
+	// human-driven Claude Code REPL session via the local broker.
+	RuntimeExecutor string
 }
 
 // Overrides allows CLI flags to override environment variables and defaults.
@@ -126,6 +143,7 @@ type Overrides struct {
 	// resolves to enabled; the flag exists so users can opt out from the CLI.
 	DisableAutoUpdate       bool
 	AutoUpdateCheckInterval time.Duration // 0 = use env/default
+	RuntimeExecutor         string        // "" = use env/default (subprocess)
 }
 
 // LoadConfig builds the daemon configuration from environment variables
@@ -471,6 +489,20 @@ func LoadConfig(overrides Overrides) (Config, error) {
 		autoUpdateInterval = overrides.AutoUpdateCheckInterval
 	}
 
+	// Runtime executor: override > env > default (subprocess).
+	runtimeExecutor := strings.TrimSpace(os.Getenv("MULTICA_RUNTIME_EXECUTOR"))
+	if overrides.RuntimeExecutor != "" {
+		runtimeExecutor = overrides.RuntimeExecutor
+	}
+	switch runtimeExecutor {
+	case "", ExecutorSubprocess:
+		runtimeExecutor = ExecutorSubprocess
+	case ExecutorRepl:
+		// ok
+	default:
+		return Config{}, fmt.Errorf("invalid runtime executor %q (expected %q or %q)", runtimeExecutor, ExecutorSubprocess, ExecutorRepl)
+	}
+
 	return Config{
 		ServerBaseURL:                  serverBaseURL,
 		DaemonID:                       daemonID,
@@ -500,6 +532,7 @@ func LoadConfig(overrides Overrides) (Config, error) {
 		ClaudeArgs:                     claudeArgs,
 		CodexArgs:                      codexArgs,
 		CodebuddyArgs:                  codebuddyArgs,
+		RuntimeExecutor:                runtimeExecutor,
 	}, nil
 }
 

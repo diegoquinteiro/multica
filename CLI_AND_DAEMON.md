@@ -160,6 +160,23 @@ You need at least one installed. The daemon registers each detected CLI as an av
 4. Heartbeats are sent periodically (default: 15s) so the server knows the daemon is alive
 5. On shutdown, all runtimes are deregistered
 
+### REPL executor mode (interactive subscription)
+
+By default the daemon executes each task by spawning the provider CLI headlessly (`claude -p`). The **repl executor** instead runs tasks inside human-launched, interactive Claude Code REPL sessions, so the work draws on your interactive subscription quota rather than the metered headless / Agent SDK path.
+
+```bash
+# Installs the multica-repl-runtime skill and runs the daemon in repl mode (foreground)
+multica runtime repl
+
+# In another terminal, open an interactive Claude Code session and start the runtime loop.
+# Open more `claude` sessions to process tasks in parallel — one task per session.
+claude
+```
+
+In this mode the daemon still owns the full lifecycle — register, claim, heartbeat, repo checkout, prompt building, and complete/fail. Only **execution** moves: each prepared task is handed to a local broker, and a REPL session running the `multica-repl-runtime` skill claims it (`multica runtime next`), runs it in the prepared workdir, and reports the outcome (`multica runtime result <job-id>`). These two commands talk to the daemon over its loopback port and return an error unless the daemon is in repl mode.
+
+Equivalent low-level form: `multica daemon start --foreground --executor repl` (or `MULTICA_RUNTIME_EXECUTOR=repl`). Concurrency is the number of open REPL sessions (each does one task at a time), bounded by `--max-concurrent-tasks`.
+
 ### Configuration
 
 Daemon behavior is configured via flags or environment variables:
@@ -171,6 +188,7 @@ Daemon behavior is configured via flags or environment variables:
 | Agent timeout | `--agent-timeout` | `MULTICA_AGENT_TIMEOUT` | `0` (no cap; bounded by the watchdogs) |
 | Codex semantic inactivity timeout | `--codex-semantic-inactivity-timeout` | `MULTICA_CODEX_SEMANTIC_INACTIVITY_TIMEOUT` | `10m` |
 | Max concurrent tasks | `--max-concurrent-tasks` | `MULTICA_DAEMON_MAX_CONCURRENT_TASKS` | `20` |
+| Task executor | `--executor` | `MULTICA_RUNTIME_EXECUTOR` | `subprocess` (`repl` for REPL mode) |
 | Daemon ID | `--daemon-id` | `MULTICA_DAEMON_ID` | hostname |
 | Device name | `--device-name` | `MULTICA_DAEMON_DEVICE_NAME` | hostname |
 | Runtime name | `--runtime-name` | `MULTICA_AGENT_RUNTIME_NAME` | `Local Agent` |
