@@ -75,6 +75,15 @@ const (
 	ExecutorRepl = "repl"
 )
 
+// DefaultRuntimeReplLease is the visibility timeout for a brokered repl task: a
+// REPL session that claims a task via `multica runtime next` but neither reports
+// a result nor renews within this window is assumed dead, and the broker
+// re-enqueues the task for another session. Sized generously because a session
+// works a task with no liveness channel back to the broker — a single long
+// silent step (a big build/test) must not trip it. A live session working past
+// the window renews its lease via `multica runtime renew`.
+const DefaultRuntimeReplLease = 30 * time.Minute
+
 // DefaultGCArtifactPatterns lists basename matches that the GC loop treats as
 // regenerable build artifacts. Kept conservative: only directories that are
 // always cheap to recreate (`pnpm install`, `next build`, `turbo build`). Things
@@ -119,6 +128,9 @@ type Config struct {
 	// (default) spawns the provider CLI per task; ExecutorRepl hands tasks to a
 	// human-driven Claude Code REPL session via the local broker.
 	RuntimeExecutor string
+	// RuntimeReplLease is the broker visibility timeout in repl executor mode:
+	// an unreported, un-renewed claimed task is re-enqueued after this long.
+	RuntimeReplLease time.Duration
 }
 
 // Overrides allows CLI flags to override environment variables and defaults.
@@ -144,6 +156,7 @@ type Overrides struct {
 	DisableAutoUpdate       bool
 	AutoUpdateCheckInterval time.Duration // 0 = use env/default
 	RuntimeExecutor         string        // "" = use env/default (subprocess)
+	RuntimeReplLease        time.Duration // 0 = use env/default
 }
 
 // LoadConfig builds the daemon configuration from environment variables
@@ -503,6 +516,15 @@ func LoadConfig(overrides Overrides) (Config, error) {
 		return Config{}, fmt.Errorf("invalid runtime executor %q (expected %q or %q)", runtimeExecutor, ExecutorSubprocess, ExecutorRepl)
 	}
 
+	// Repl broker lease: override > env > default.
+	runtimeReplLease, err := durationFromEnv("MULTICA_RUNTIME_REPL_LEASE", DefaultRuntimeReplLease)
+	if err != nil {
+		return Config{}, err
+	}
+	if overrides.RuntimeReplLease > 0 {
+		runtimeReplLease = overrides.RuntimeReplLease
+	}
+
 	return Config{
 		ServerBaseURL:                  serverBaseURL,
 		DaemonID:                       daemonID,
@@ -533,6 +555,7 @@ func LoadConfig(overrides Overrides) (Config, error) {
 		CodexArgs:                      codexArgs,
 		CodebuddyArgs:                  codebuddyArgs,
 		RuntimeExecutor:                runtimeExecutor,
+		RuntimeReplLease:               runtimeReplLease,
 	}, nil
 }
 

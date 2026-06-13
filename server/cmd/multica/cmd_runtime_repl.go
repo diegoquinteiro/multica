@@ -59,10 +59,18 @@ var runtimeResultCmd = &cobra.Command{
 	RunE:  runRuntimeResult,
 }
 
+var runtimeRenewCmd = &cobra.Command{
+	Use:   "renew <job-id>",
+	Short: "Extend the lease on an in-flight repl task (call during long work so it is not reclaimed)",
+	Args:  exactArgs(1),
+	RunE:  runRuntimeRenew,
+}
+
 func init() {
 	runtimeCmd.AddCommand(runtimeReplCmd)
 	runtimeCmd.AddCommand(runtimeNextCmd)
 	runtimeCmd.AddCommand(runtimeResultCmd)
+	runtimeCmd.AddCommand(runtimeRenewCmd)
 
 	runtimeReplCmd.Flags().Bool("skip-skill-install", false, "Do not (re)install the multica-repl-runtime skill into ~/.claude/skills")
 
@@ -75,6 +83,8 @@ func init() {
 	runtimeResultCmd.Flags().String("summary-file", "", "Read the summary from a UTF-8 file (verbatim, multi-line)")
 	runtimeResultCmd.Flags().String("error", "", "Error detail when --status failed")
 	runtimeResultCmd.Flags().String("output", "json", "Output format: json")
+
+	runtimeRenewCmd.Flags().String("output", "json", "Output format: json")
 }
 
 // daemonLoopbackPort resolves the local daemon's loopback port: an explicit
@@ -221,6 +231,40 @@ func runRuntimeResult(cmd *cobra.Command, args []string) error {
 	// daemon's JSON rather than erroring so the skill can move on cleanly.
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
 		return fmt.Errorf("runtime result failed (%d): %s", resp.StatusCode, string(respBody))
+	}
+
+	var pretty map[string]any
+	if err := json.Unmarshal(respBody, &pretty); err != nil {
+		return fmt.Errorf("parse daemon response: %w", err)
+	}
+	return cli.PrintJSON(os.Stdout, pretty)
+}
+
+// --- runtime renew ---
+
+func runRuntimeRenew(cmd *cobra.Command, args []string) error {
+	port := daemonLoopbackPort(cmd)
+	data, err := json.Marshal(map[string]string{"job_id": args[0]})
+	if err != nil {
+		return fmt.Errorf("encode request: %w", err)
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Post(
+		fmt.Sprintf("http://127.0.0.1:%d/runtime/renew", port),
+		"application/json",
+		bytes.NewReader(data),
+	)
+	if err != nil {
+		return fmt.Errorf("connect to daemon on 127.0.0.1:%d: %w", port, err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	// 404 means the lease could not be renewed (job gone); surface the JSON
+	// rather than erroring so the skill can react without aborting.
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("runtime renew failed (%d): %s", resp.StatusCode, string(respBody))
 	}
 
 	var pretty map[string]any

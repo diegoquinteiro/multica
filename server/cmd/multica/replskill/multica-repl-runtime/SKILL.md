@@ -47,6 +47,15 @@ Repeat these steps until the user asks you to stop:
      native tools, exactly as you would a normal Multica task. The prompt tells
      you which issue to read and what to do; follow it, including posting any
      result comment or opening a PR it asks for.
+   - **Keep the lease alive on long work.** A claimed task has a lease (default
+     30 min). If you neither report nor renew within it, the daemon assumes this
+     session died and re-enqueues the task for another session — which would run
+     it twice. For any task that may take a while, run `multica runtime renew
+     <job_id>` periodically (e.g. before each long build/test step):
+
+     ```bash
+     multica runtime renew <job_id>
+     ```
 
 4. **Report the result**, passing back the `job_id` from step 3:
 
@@ -70,9 +79,10 @@ the same broker. There is no global one-at-a-time cap.
 
 ## Notes
 
-- A task whose `job_id` is unknown when you report (the daemon was restarted, or
-  the task was cancelled server-side) returns `{"delivered": false}`. That is
-  not an error in your work — just move on to the next task.
+- A task whose `job_id` is unknown when you report (the daemon was restarted, the
+  task was cancelled server-side, or your lease expired and the task was already
+  recovered by another session) returns `{"delivered": false}`. That is not an
+  error in your work — just move on to the next task.
 - All Multica platform interaction goes through the `multica` CLI. Do not call
   Multica HTTP endpoints directly.
 

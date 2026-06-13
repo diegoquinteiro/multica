@@ -85,6 +85,7 @@ func init() {
 	f.Bool("no-auto-update", false, "Disable periodic CLI self-update (env: MULTICA_DAEMON_AUTO_UPDATE=false)")
 	f.Duration("auto-update-interval", 0, "How often to poll GitHub for a newer release (env: MULTICA_DAEMON_AUTO_UPDATE_INTERVAL)")
 	f.String("executor", "", "Task executor mode: subprocess (default) or repl (env: MULTICA_RUNTIME_EXECUTOR)")
+	f.Duration("repl-lease", 0, "Repl executor: re-enqueue a claimed task after this long without a result or renew (env: MULTICA_RUNTIME_REPL_LEASE)")
 
 	daemonLogsCmd.Flags().BoolP("follow", "f", false, "Follow log output")
 	daemonLogsCmd.Flags().IntP("lines", "n", 50, "Number of lines to show")
@@ -105,6 +106,7 @@ func init() {
 	rf.Bool("no-auto-update", false, "Disable periodic CLI self-update (env: MULTICA_DAEMON_AUTO_UPDATE=false)")
 	rf.Duration("auto-update-interval", 0, "How often to poll GitHub for a newer release (env: MULTICA_DAEMON_AUTO_UPDATE_INTERVAL)")
 	rf.String("executor", "", "Task executor mode: subprocess (default) or repl (env: MULTICA_RUNTIME_EXECUTOR)")
+	rf.Duration("repl-lease", 0, "Repl executor: re-enqueue a claimed task after this long without a result or renew (env: MULTICA_RUNTIME_REPL_LEASE)")
 
 	df := daemonDiskUsageCmd.Flags()
 	df.Bool("by-workspace", false, "Aggregate output by workspace instead of by task")
@@ -320,6 +322,9 @@ func buildDaemonStartArgs(cmd *cobra.Command) []string {
 	if v := flagString(cmd, "executor"); v != "" {
 		args = append(args, "--executor", v)
 	}
+	if d, _ := cmd.Flags().GetDuration("repl-lease"); d > 0 {
+		args = append(args, "--repl-lease", d.String())
+	}
 
 	// Forward global persistent flags.
 	if v, _ := cmd.Flags().GetString("server-url"); v != "" {
@@ -362,6 +367,9 @@ func startDaemonForeground(cmd *cobra.Command, executorOverride string) error {
 		Profile:         profile,
 		HealthPort:      healthPortForProfile(profile),
 		RuntimeExecutor: executor,
+	}
+	if d, _ := cmd.Flags().GetDuration("repl-lease"); d > 0 {
+		overrides.RuntimeReplLease = d
 	}
 	if d, _ := cmd.Flags().GetDuration("poll-interval"); d > 0 {
 		overrides.PollInterval = d

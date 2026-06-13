@@ -47,11 +47,12 @@ multica repo checkout <url> --ref <branch-or-sha>
 multica runtime repl
 multica runtime next --output json
 multica runtime result <job-id> --status completed --summary "..."
+multica runtime renew <job-id>
 ```
 
 `runtime update` is a write. `repo checkout` creates a git worktree in the task working directory.
 
-`runtime repl` installs the `multica-repl-runtime` skill and runs the daemon in repl executor mode (foreground). `runtime next` / `runtime result` are the broker handoff the REPL session uses to claim a task and report its outcome; they talk to the local daemon loopback (`MULTICA_DAEMON_PORT` or the profile health port) and return 503 unless the daemon runs with `--executor repl`. Each REPL session runs one task at a time; open multiple `claude` sessions for parallelism.
+`runtime repl` installs the `multica-repl-runtime` skill and runs the daemon in repl executor mode (foreground). `runtime next` / `runtime result` / `runtime renew` are the broker handoff the REPL session uses to claim a task, report its outcome, and extend its lease; they talk to the local daemon loopback (`MULTICA_DAEMON_PORT` or the profile health port) and return 503 unless the daemon runs with `--executor repl`. Each REPL session runs one task at a time; open multiple `claude` sessions for parallelism. A claimed task carries a lease (default 30m, `--repl-lease` / `MULTICA_RUNTIME_REPL_LEASE`): if the session dies before reporting, the broker re-enqueues the task so another session recovers it; a live long task keeps its lease with `runtime renew`.
 
 `repo checkout` requires `MULTICA_DAEMON_PORT`; it is intended to run inside a daemon task. If absent, you are not in the normal agent checkout path.
 

@@ -194,8 +194,8 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 	d.runner = taskRunnerFunc(d.runTask)
 	d.runUpdateFn = d.runUpdate
 	if cfg.RuntimeExecutor == ExecutorRepl {
-		d.replBroker = newReplBroker(logger)
-		logger.Info("runtime executor: repl (tasks run in human-launched REPL sessions via the local broker)")
+		d.replBroker = newReplBroker(logger, cfg.RuntimeReplLease)
+		logger.Info("runtime executor: repl (tasks run in human-launched REPL sessions via the local broker)", "lease", d.replBroker.lease.String())
 	}
 	return d
 }
@@ -669,6 +669,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	go d.gcLoop(ctx)
 	go d.autoUpdateLoop(ctx)
 	go d.tokenRenewalLoop(ctx)
+	if d.replBroker != nil {
+		go d.replBroker.runReaper(ctx)
+	}
 
 	// Preflight succeeded and the background loops are up: the daemon has
 	// registered its runtimes and can now claim and run tasks. Flip /health

@@ -177,6 +177,8 @@ In this mode the daemon still owns the full lifecycle — register, claim, heart
 
 Equivalent low-level form: `multica daemon start --foreground --executor repl` (or `MULTICA_RUNTIME_EXECUTOR=repl`). Concurrency is the number of open REPL sessions (each does one task at a time), bounded by `--max-concurrent-tasks`.
 
+**Crash recovery (lease / visibility timeout).** A claimed task carries a lease (`--repl-lease` / `MULTICA_RUNTIME_REPL_LEASE`, default `30m`). If a REPL session dies after claiming a task but before reporting a result, the broker re-enqueues the task once the lease elapses, so another session recovers it instead of the task hanging in `running` forever. A live session working a task longer than the lease keeps it with `multica runtime renew <job-id>` (the `multica-repl-runtime` skill does this during long steps).
+
 ### Configuration
 
 Daemon behavior is configured via flags or environment variables:
@@ -189,6 +191,7 @@ Daemon behavior is configured via flags or environment variables:
 | Codex semantic inactivity timeout | `--codex-semantic-inactivity-timeout` | `MULTICA_CODEX_SEMANTIC_INACTIVITY_TIMEOUT` | `10m` |
 | Max concurrent tasks | `--max-concurrent-tasks` | `MULTICA_DAEMON_MAX_CONCURRENT_TASKS` | `20` |
 | Task executor | `--executor` | `MULTICA_RUNTIME_EXECUTOR` | `subprocess` (`repl` for REPL mode) |
+| Repl task lease | `--repl-lease` | `MULTICA_RUNTIME_REPL_LEASE` | `30m` |
 | Daemon ID | `--daemon-id` | `MULTICA_DAEMON_ID` | hostname |
 | Device name | `--device-name` | `MULTICA_DAEMON_DEVICE_NAME` | hostname |
 | Runtime name | `--runtime-name` | `MULTICA_AGENT_RUNTIME_NAME` | `Local Agent` |
