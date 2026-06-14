@@ -12,6 +12,12 @@ export type AgentVisibility = "workspace" | "private";
 // "private" so the strictest behavior is the fallback.
 export type RuntimeVisibility = "private" | "public";
 
+// How a local daemon executes claimed tasks: "subprocess" (default, headless —
+// the daemon spawns the provider CLI per task) or "repl" (tasks are handed to a
+// human-launched Claude Code REPL session via the local broker). Older backends
+// omit the field; the consumer must default to "subprocess".
+export type RuntimeExecutor = "subprocess" | "repl";
+
 export interface RuntimeDevice {
   id: string;
   workspace_id: string;
@@ -19,6 +25,8 @@ export interface RuntimeDevice {
   name: string;
   runtime_mode: AgentRuntimeMode;
   provider: string;
+  /** Defaults to "subprocess" when the backend predates the executor field. */
+  executor?: RuntimeExecutor;
   launch_header: string;
   status: "online" | "offline";
   device_info: string;

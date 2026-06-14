@@ -1,7 +1,7 @@
 # Runtimes and repos source map
 
 - `server/cmd/multica/cmd_runtime.go` registers `runtime list`, `usage`, `activity`, and `update`.
-- `runtime list` reads `/api/runtimes` and prints `id`, `name`, `runtime_mode`, `provider`, `status`, and `last_seen_at`.
+- `runtime list` reads `/api/runtimes` and prints `id`, `name`, `runtime_mode`, `provider`, `executor`, `status`, and `last_seen_at`. The `executor` field (`subprocess` default, or `repl`) comes from `agent_runtime.executor`, set at daemon registration from `Config.RuntimeExecutor`; `AgentRuntimeResponse` in `server/internal/handler/runtime.go` exposes it.
 - `runtime update` posts to `/api/runtimes/{runtime-id}/update`; with `--wait` it polls update status.
 - `server/cmd/multica/cmd_runtime_repl.go` registers `runtime repl`, `runtime next`, `runtime result`, and `runtime renew`, and installs the embedded `multica-repl-runtime` skill into `~/.claude/skills/`.
 - `runtime repl` calls `startDaemonForeground(cmd, "repl")` (`server/cmd/multica/cmd_daemon.go`); `--executor` / `MULTICA_RUNTIME_EXECUTOR` resolves `Config.RuntimeExecutor` in `server/internal/daemon/config.go` (`ExecutorSubprocess` default, `ExecutorRepl`).

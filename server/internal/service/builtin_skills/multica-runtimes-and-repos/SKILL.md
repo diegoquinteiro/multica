@@ -33,7 +33,7 @@ The chain is:
 6. daemon prepares a workdir and launches the provider CLI;
 7. `multica repo checkout` talks to the local daemon, not directly to GitHub.
 
-The daemon has two executor modes (step 6). `subprocess` (default) spawns the provider CLI (`claude -p`) per task. `repl` instead hands each prepared task to a local broker and waits for a human-launched Claude Code REPL session to run it on the interactive subscription quota — the daemon still owns register/claim/heartbeat/checkout. Select with `--executor repl` / `MULTICA_RUNTIME_EXECUTOR=repl`.
+The daemon has two executor modes (step 6). `subprocess` (default) spawns the provider CLI (`claude -p`) per task. `repl` instead hands each prepared task to a local broker and waits for a human-launched Claude Code REPL session to run it on the interactive subscription quota — the daemon still owns register/claim/heartbeat/checkout. Select with `--executor repl` / `MULTICA_RUNTIME_EXECUTOR=repl`. `multica runtime list` shows each runtime's `executor` column so you can tell a REPL-driven machine from a headless one.
 
 ## CLI
 

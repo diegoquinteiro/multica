@@ -36,6 +36,13 @@ func (b *replBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 		Prompt:     prompt,
 		Model:      opts.Model,
 		ThreadName: opts.ThreadName,
+		// The daemon builds the full agent env (token, agent id, ...) before the
+		// backend split, so the task-scoped context is already here. Forward it
+		// so the REPL session can authenticate and scope as the agent.
+		AuthToken:   b.cfg.Env["MULTICA_TOKEN"],
+		AgentID:     b.cfg.Env["MULTICA_AGENT_ID"],
+		WorkspaceID: b.cfg.Env["MULTICA_WORKSPACE_ID"],
+		AgentName:   b.cfg.Env["MULTICA_AGENT_NAME"],
 	}
 
 	msgCh := make(chan Message, 8)

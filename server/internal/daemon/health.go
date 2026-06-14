@@ -58,15 +58,29 @@ func (d *Daemon) listenHealth() (net.Listener, error) {
 // task; the broker holds the request open up to the wait window so an idle
 // session does not busy-loop, then returns an empty body so the caller can ask
 // again. The caller may shorten the window with ?wait=<seconds>.
+//
+// The window is deliberately long: each empty return hands control back to the
+// REPL session's LLM, which costs a full turn (system prompt + skill + history)
+// even when there is no work. A short window meant an idle session re-woke the
+// model dozens of times an hour. With a long broker-side hold (and the CLI's
+// `runtime next --block`, which re-chains polls without returning), an idle
+// session spends essentially zero tokens until real work arrives. The hold is a
+// plain blocking select on a Go channel — it consumes no tokens — over a
+// loopback connection with no proxy and an http.Server with no Read/Write/Idle
+// timeouts, so minutes-long polls are safe.
 const (
-	defaultRuntimeNextWait = 25 * time.Second
-	maxRuntimeNextWait     = 60 * time.Second
+	defaultRuntimeNextWait = 300 * time.Second
+	maxRuntimeNextWait     = 1800 * time.Second
 )
 
 // runtimeNextResponse is the body of GET /runtime/next. Job is nil when the
-// wait window elapsed with no task to hand out.
+// wait window elapsed with no task to hand out. Auth carries the job's
+// task-scoped credentials separately from Job so the secret never has to live
+// on the human-facing job object the skill prints; the CLI writes it to a
+// per-job file and strips it from what it shows the session.
 type runtimeNextResponse struct {
-	Job *runtimeJob `json:"job"`
+	Job  *runtimeJob     `json:"job"`
+	Auth *runtimeJobAuth `json:"auth,omitempty"`
 }
 
 // runtimeJob is the REPL-facing view of a brokered task.
@@ -77,6 +91,22 @@ type runtimeJob struct {
 	Prompt     string `json:"prompt"`
 	Model      string `json:"model,omitempty"`
 	ThreadName string `json:"thread_name,omitempty"`
+}
+
+// runtimeJobAuth carries the task-scoped credentials the daemon would otherwise
+// inject as env into a headless subprocess. In repl mode those never reach the
+// REPL session, so every `multica` call there would authenticate as the runtime
+// owner (a member) instead of the agent — which 403s agent-only endpoints such
+// as `squad activity` and breaks `repo checkout`. The CLI persists this to
+// <cwd>/.multica/job-auth.json so each independent `multica` invocation in the
+// job authenticates as the agent, exactly like the headless path.
+type runtimeJobAuth struct {
+	Token       string `json:"token,omitempty"`
+	AgentID     string `json:"agent_id,omitempty"`
+	TaskID      string `json:"task_id,omitempty"`
+	WorkspaceID string `json:"workspace_id,omitempty"`
+	AgentName   string `json:"agent_name,omitempty"`
+	DaemonPort  int    `json:"daemon_port,omitempty"`
 }
 
 // runtimeResultRequest is the body of POST /runtime/result.
@@ -286,14 +316,24 @@ func (d *Daemon) runtimeNextHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(runtimeNextResponse{Job: nil})
 		return
 	}
-	json.NewEncoder(w).Encode(runtimeNextResponse{Job: &runtimeJob{
-		JobID:      job.id,
-		TaskID:     job.task.TaskID,
-		Cwd:        job.task.Cwd,
-		Prompt:     job.task.Prompt,
-		Model:      job.task.Model,
-		ThreadName: job.task.ThreadName,
-	}})
+	json.NewEncoder(w).Encode(runtimeNextResponse{
+		Job: &runtimeJob{
+			JobID:      job.id,
+			TaskID:     job.task.TaskID,
+			Cwd:        job.task.Cwd,
+			Prompt:     job.task.Prompt,
+			Model:      job.task.Model,
+			ThreadName: job.task.ThreadName,
+		},
+		Auth: &runtimeJobAuth{
+			Token:       job.task.AuthToken,
+			AgentID:     job.task.AgentID,
+			TaskID:      job.task.TaskID,
+			WorkspaceID: job.task.WorkspaceID,
+			AgentName:   job.task.AgentName,
+			DaemonPort:  d.cfg.HealthPort,
+		},
+	})
 }
 
 // runtimeResultHandler accepts a REPL session's result for a brokered job and

@@ -249,12 +249,19 @@ func newAPIClient(cmd *cobra.Command) (*cli.APIClient, error) {
 	}
 
 	client := cli.NewAPIClient(serverURL, workspaceID, token)
-	// When running inside a daemon task, attribute actions to the agent.
+	// When running inside a daemon task, attribute actions to the agent. The env
+	// is present for headless subprocesses; a repl job has no env, so fall back
+	// to the credential `runtime next` persisted for the job.
+	ja := loadJobAuth()
 	if agentID := os.Getenv("MULTICA_AGENT_ID"); agentID != "" {
 		client.AgentID = agentID
+	} else if ja.AgentID != "" {
+		client.AgentID = ja.AgentID
 	}
 	if taskID := os.Getenv("MULTICA_TASK_ID"); taskID != "" {
 		client.TaskID = taskID
+	} else if ja.TaskID != "" {
+		client.TaskID = ja.TaskID
 	}
 	return client, nil
 }
@@ -290,13 +297,23 @@ func normalizeAPIBaseURL(raw string) string {
 // user last configured, which is how cross-workspace contamination happens
 // when multiple workspaces share a host.
 func inAgentExecutionContext() bool {
-	return os.Getenv("MULTICA_AGENT_ID") != "" || os.Getenv("MULTICA_TASK_ID") != ""
+	if os.Getenv("MULTICA_AGENT_ID") != "" || os.Getenv("MULTICA_TASK_ID") != "" {
+		return true
+	}
+	// A repl job carries the same context in a file rather than env.
+	ja := loadJobAuth()
+	return ja.AgentID != "" || ja.TaskID != ""
 }
 
 func resolveWorkspaceID(cmd *cobra.Command) string {
 	val := cli.FlagOrEnv(cmd, "workspace-id", "MULTICA_WORKSPACE_ID", "")
 	if val != "" {
 		return val
+	}
+	// A repl job's workspace comes from the credential the daemon minted for it,
+	// not the user-global config.
+	if ws := loadJobAuth().WorkspaceID; ws != "" {
+		return ws
 	}
 	// Inside an agent task the daemon is the only authority on workspace
 	// identity. Never read the user-global CLI config here.

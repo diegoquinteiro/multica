@@ -71,6 +71,13 @@ func resolveToken(cmd *cobra.Command) string {
 	if v := strings.TrimSpace(os.Getenv("MULTICA_TOKEN")); v != "" {
 		return v
 	}
+	// Inside a repl job the daemon injects no env, so fall back to the
+	// task-scoped token `runtime next` persisted for this job. This makes the
+	// REPL session authenticate as the agent (not the runtime owner), matching
+	// the headless path's MULTICA_TOKEN. See cmd_runtime_repl.go.
+	if t := strings.TrimSpace(loadJobAuth().Token); t != "" {
+		return t
+	}
 	profile := resolveProfile(cmd)
 	cfg, _ := cli.LoadCLIConfigForProfile(profile)
 	return cfg.Token
