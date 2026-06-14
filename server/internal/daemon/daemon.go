@@ -770,16 +770,11 @@ func (d *Daemon) registerRuntimesForWorkspace(ctx context.Context, workspaceID s
 		if d.cfg.DeviceName != "" {
 			displayName = fmt.Sprintf("%s (%s)", displayName, d.cfg.DeviceName)
 		}
-		executor := d.cfg.RuntimeExecutor
-		if executor == "" {
-			executor = ExecutorSubprocess
-		}
 		runtimes = append(runtimes, map[string]string{
-			"name":     displayName,
-			"type":     name,
-			"version":  version,
-			"status":   "online",
-			"executor": executor,
+			"name":    displayName,
+			"type":    name,
+			"version": version,
+			"status":  "online",
 		})
 	}
 	if len(runtimes) == 0 {

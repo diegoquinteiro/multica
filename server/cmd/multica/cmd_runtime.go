@@ -88,19 +88,14 @@ func runRuntimeList(cmd *cobra.Command, _ []string) error {
 		return cli.PrintJSON(os.Stdout, runtimes)
 	}
 
-	headers := []string{"ID", "NAME", "MODE", "PROVIDER", "EXECUTOR", "STATUS", "LAST_SEEN"}
+	headers := []string{"ID", "NAME", "MODE", "PROVIDER", "STATUS", "LAST_SEEN"}
 	rows := make([][]string, 0, len(runtimes))
 	for _, rt := range runtimes {
-		executor := strVal(rt, "executor")
-		if executor == "" {
-			executor = "subprocess"
-		}
 		rows = append(rows, []string{
 			strVal(rt, "id"),
 			strVal(rt, "name"),
 			strVal(rt, "runtime_mode"),
 			strVal(rt, "provider"),
-			executor,
 			strVal(rt, "status"),
 			strVal(rt, "last_seen_at"),
 		})
