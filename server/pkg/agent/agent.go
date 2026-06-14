@@ -153,6 +153,16 @@ type ReplTask struct {
 	Prompt     string
 	Model      string
 	ThreadName string
+	// AuthToken, AgentID, WorkspaceID and AgentName are the task-scoped context
+	// the daemon mints at claim time (the same values headless injects as
+	// MULTICA_TOKEN / MULTICA_AGENT_ID / MULTICA_WORKSPACE_ID /
+	// MULTICA_AGENT_NAME). The broker forwards them to the REPL session so its
+	// `multica` calls authenticate and scope as the agent rather than the
+	// runtime owner.
+	AuthToken   string
+	AgentID     string
+	WorkspaceID string
+	AgentName   string
 }
 
 // ReplBroker is the daemon-side handoff the repl backend depends on. The daemon

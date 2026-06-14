@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"io/fs"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"time"
@@ -74,7 +76,8 @@ func init() {
 
 	runtimeReplCmd.Flags().Bool("skip-skill-install", false, "Do not (re)install the multica-repl-runtime skill into ~/.claude/skills")
 
-	runtimeNextCmd.Flags().Int("wait", 25, "Seconds to long-poll for a task before returning {\"job\": null} (max 60)")
+	runtimeNextCmd.Flags().Int("wait", 300, "Seconds to long-poll for a task before returning {\"job\": null} (max 1800)")
+	runtimeNextCmd.Flags().Bool("block", false, "Keep re-polling internally and only return once a real job is claimed (one model turn per job, no idle wake-ups)")
 	runtimeNextCmd.Flags().String("output", "json", "Output format: json")
 
 	runtimeResultCmd.Flags().String("status", "completed", "Task outcome: completed or failed")
@@ -88,15 +91,100 @@ func init() {
 }
 
 // daemonLoopbackPort resolves the local daemon's loopback port: an explicit
-// MULTICA_DAEMON_PORT (set inside daemon-spawned tasks) wins, otherwise the
-// health port for the active profile — the same port `daemon status` probes.
+// MULTICA_DAEMON_PORT (set inside daemon-spawned tasks) wins, then the port
+// persisted by `runtime next` for the current repl job (so commands like
+// `repo checkout` work inside a REPL session, which gets no env from the
+// daemon), otherwise the health port for the active profile — the same port
+// `daemon status` probes.
 func daemonLoopbackPort(cmd *cobra.Command) int {
 	if v := os.Getenv("MULTICA_DAEMON_PORT"); v != "" {
 		if p, err := strconv.Atoi(v); err == nil && p > 0 {
 			return p
 		}
 	}
+	if ja := loadJobAuth(); ja.DaemonPort > 0 {
+		return ja.DaemonPort
+	}
 	return healthPortForProfile(resolveProfile(cmd))
+}
+
+// --- repl job credentials ---
+//
+// In repl executor mode the daemon does not spawn a subprocess, so the
+// task-scoped credential and daemon port it would normally inject as env never
+// reach the human-launched REPL session. `runtime next` persists them into the
+// job's prepared workdir (<cwd>/.multica/job-auth.json, mode 0600); the env
+// resolvers fall back to this file so every independent `multica` invocation in
+// the job authenticates as the agent — fixing the 403 on agent-only endpoints
+// (e.g. `squad activity`) and unblocking `repo checkout`. `runtime result`
+// removes the file when the job ends.
+
+const jobAuthRelPath = ".multica/job-auth.json"
+
+type jobAuth struct {
+	Token       string `json:"token,omitempty"`
+	AgentID     string `json:"agent_id,omitempty"`
+	TaskID      string `json:"task_id,omitempty"`
+	WorkspaceID string `json:"workspace_id,omitempty"`
+	AgentName   string `json:"agent_name,omitempty"`
+	DaemonPort  int    `json:"daemon_port,omitempty"`
+}
+
+// findJobAuthFile walks up from the current working directory looking for the
+// nearest .multica/job-auth.json. Returns "" outside a repl job (the common
+// case for ordinary CLI use).
+func findJobAuthFile() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	for {
+		candidate := filepath.Join(dir, jobAuthRelPath)
+		if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
+			return candidate
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
+}
+
+// loadJobAuth reads the nearest job-auth file, or returns a zero value when
+// there is none or it cannot be parsed (callers then fall back to env/profile).
+func loadJobAuth() jobAuth {
+	path := findJobAuthFile()
+	if path == "" {
+		return jobAuth{}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return jobAuth{}
+	}
+	var ja jobAuth
+	_ = json.Unmarshal(data, &ja)
+	return ja
+}
+
+// writeJobAuth persists the job credential into the job's prepared workdir.
+func writeJobAuth(cwd string, ja jobAuth) error {
+	dir := filepath.Join(cwd, ".multica")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	data, err := json.Marshal(ja)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "job-auth.json"), data, 0o600)
+}
+
+// removeJobAuth deletes the nearest job-auth file (best effort) when a job ends.
+func removeJobAuth() {
+	if path := findJobAuthFile(); path != "" {
+		_ = os.Remove(path)
+	}
 }
 
 // --- runtime repl ---
@@ -159,34 +247,101 @@ func installReplSkill() (string, error) {
 
 // --- runtime next ---
 
+// runtimeNextResult mirrors the daemon's runtimeNextResponse. Auth is parsed
+// here but never printed — it is persisted to the job-auth file instead so the
+// task token stays out of the REPL transcript.
+type runtimeNextResult struct {
+	Job  *runtimeJobView `json:"job"`
+	Auth *jobAuth        `json:"auth,omitempty"`
+}
+
+type runtimeJobView struct {
+	JobID      string `json:"job_id"`
+	TaskID     string `json:"task_id,omitempty"`
+	Cwd        string `json:"cwd"`
+	Prompt     string `json:"prompt"`
+	Model      string `json:"model,omitempty"`
+	ThreadName string `json:"thread_name,omitempty"`
+}
+
 func runRuntimeNext(cmd *cobra.Command, _ []string) error {
 	wait, _ := cmd.Flags().GetInt("wait")
 	if wait < 0 {
 		wait = 0
 	}
+	block, _ := cmd.Flags().GetBool("block")
 	port := daemonLoopbackPort(cmd)
 
+	// In --block mode Ctrl-C should end the loop cleanly rather than abort with
+	// an error, so a user can stop the runtime gracefully.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	for {
+		result, err := pollRuntimeNext(ctx, port, wait)
+		if err != nil {
+			if ctx.Err() != nil {
+				// Interrupted (Ctrl-C): exit quietly.
+				return nil
+			}
+			if block {
+				// The daemon may be restarting; back off briefly and retry
+				// instead of ending the session's loop on a transient error.
+				fmt.Fprintf(os.Stderr, "runtime next: %v; retrying in 2s\n", err)
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(2 * time.Second):
+				}
+				continue
+			}
+			return err
+		}
+
+		// With --block, keep the model asleep until there is real work: an empty
+		// return re-polls internally instead of handing control back to the LLM.
+		if block && result.Job == nil {
+			continue
+		}
+
+		if result.Job != nil && result.Auth != nil {
+			if err := writeJobAuth(result.Job.Cwd, *result.Auth); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not persist job auth (%s): %v\n", result.Job.Cwd, err)
+			}
+		}
+
+		// Print only the job — never the auth secret — keeping the stable
+		// {"job": ...} shape the skill consumes.
+		return cli.PrintJSON(os.Stdout, map[string]any{"job": result.Job})
+	}
+}
+
+// pollRuntimeNext performs a single long-poll against the local daemon.
+func pollRuntimeNext(ctx context.Context, port, wait int) (*runtimeNextResult, error) {
 	// Allow the daemon's long-poll window plus a margin before the HTTP client
 	// gives up, so the client never times out ahead of the server's own wait.
 	client := &http.Client{Timeout: time.Duration(wait)*time.Second + 10*time.Second}
 	url := fmt.Sprintf("http://127.0.0.1:%d/runtime/next?wait=%d", port, wait)
-	resp, err := client.Get(url)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return fmt.Errorf("connect to daemon on 127.0.0.1:%d (is `multica runtime repl` running?): %w", port, err)
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("connect to daemon on 127.0.0.1:%d (is `multica runtime repl` running?): %w", port, err)
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("runtime next failed (%d): %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("runtime next failed (%d): %s", resp.StatusCode, string(body))
 	}
 
-	// Pass the daemon's JSON through unchanged so the skill sees a stable shape.
-	var pretty map[string]any
-	if err := json.Unmarshal(body, &pretty); err != nil {
-		return fmt.Errorf("parse daemon response: %w", err)
+	var result runtimeNextResult
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("parse daemon response: %w", err)
 	}
-	return cli.PrintJSON(os.Stdout, pretty)
+	return &result, nil
 }
 
 // --- runtime result ---
@@ -232,6 +387,10 @@ func runRuntimeResult(cmd *cobra.Command, args []string) error {
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
 		return fmt.Errorf("runtime result failed (%d): %s", resp.StatusCode, string(respBody))
 	}
+
+	// The job is over either way — drop its persisted credential so a later
+	// stray `multica` call in this workdir cannot keep acting as the agent.
+	removeJobAuth()
 
 	var pretty map[string]any
 	if err := json.Unmarshal(respBody, &pretty); err != nil {

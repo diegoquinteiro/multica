@@ -8,12 +8,23 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/multica-ai/multica/server/internal/cli"
 	"github.com/spf13/cobra"
 )
+
+// firstNonEmpty returns the first non-empty string from vals, or "".
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
 
 var repoCmd = &cobra.Command{
 	Use:   "repo",
@@ -334,14 +345,20 @@ func runRepoRemove(cmd *cobra.Command, args []string) error {
 func runRepoCheckout(cmd *cobra.Command, args []string) error {
 	repoURL := args[0]
 
+	// Headless subprocesses get this context as env; a repl job has no env, so
+	// fall back to the credential `runtime next` persisted for the job.
+	ja := loadJobAuth()
 	daemonPort := os.Getenv("MULTICA_DAEMON_PORT")
+	if daemonPort == "" && ja.DaemonPort > 0 {
+		daemonPort = strconv.Itoa(ja.DaemonPort)
+	}
 	if daemonPort == "" {
-		return fmt.Errorf("MULTICA_DAEMON_PORT not set (this command is intended to be run by an agent inside a daemon task)")
+		return fmt.Errorf("MULTICA_DAEMON_PORT not set (this command is intended to be run by an agent inside a daemon task or a repl runtime job)")
 	}
 
-	workspaceID := os.Getenv("MULTICA_WORKSPACE_ID")
-	agentName := os.Getenv("MULTICA_AGENT_NAME")
-	taskID := os.Getenv("MULTICA_TASK_ID")
+	workspaceID := firstNonEmpty(os.Getenv("MULTICA_WORKSPACE_ID"), ja.WorkspaceID)
+	agentName := firstNonEmpty(os.Getenv("MULTICA_AGENT_NAME"), ja.AgentName)
+	taskID := firstNonEmpty(os.Getenv("MULTICA_TASK_ID"), ja.TaskID)
 
 	// Use current working directory as the checkout target.
 	workDir, err := os.Getwd()
