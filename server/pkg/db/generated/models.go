@@ -62,6 +62,7 @@ type AgentRuntime struct {
 	OwnerID        pgtype.UUID        `json:"owner_id"`
 	LegacyDaemonID pgtype.Text        `json:"legacy_daemon_id"`
 	Visibility     string             `json:"visibility"`
+	Executor       string             `json:"executor"`
 }
 
 type AgentSkill struct {

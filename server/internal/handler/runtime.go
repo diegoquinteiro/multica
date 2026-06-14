@@ -18,12 +18,17 @@ import (
 )
 
 type AgentRuntimeResponse struct {
-	ID           string  `json:"id"`
-	WorkspaceID  string  `json:"workspace_id"`
-	DaemonID     *string `json:"daemon_id"`
-	Name         string  `json:"name"`
-	RuntimeMode  string  `json:"runtime_mode"`
-	Provider     string  `json:"provider"`
+	ID          string  `json:"id"`
+	WorkspaceID string  `json:"workspace_id"`
+	DaemonID    *string `json:"daemon_id"`
+	Name        string  `json:"name"`
+	RuntimeMode string  `json:"runtime_mode"`
+	Provider    string  `json:"provider"`
+	// Executor is the per-daemon task execution mode: "subprocess" (default,
+	// headless — the daemon spawns the provider CLI) or "repl" (tasks are
+	// handed to a human-launched Claude Code REPL session). It distinguishes a
+	// REPL-driven machine from a headless one in the runtime list.
+	Executor     string  `json:"executor"`
 	LaunchHeader string  `json:"launch_header"`
 	Status       string  `json:"status"`
 	DeviceInfo   string  `json:"device_info"`
@@ -54,6 +59,7 @@ func runtimeToResponse(rt db.AgentRuntime) AgentRuntimeResponse {
 		Name:         rt.Name,
 		RuntimeMode:  rt.RuntimeMode,
 		Provider:     rt.Provider,
+		Executor:     rt.Executor,
 		LaunchHeader: agent.LaunchHeader(rt.Provider),
 		Status:       rt.Status,
 		DeviceInfo:   rt.DeviceInfo,
