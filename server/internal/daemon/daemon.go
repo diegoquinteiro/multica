@@ -97,6 +97,12 @@ type Daemon struct {
 	// that claim tasks over the loopback health server.
 	replBroker *replBroker
 
+	// replTranscript is non-nil only in repl executor mode. It forwards the
+	// REPL session's Claude Code transcript (JSONL) to the backend as task
+	// messages so a task running interactively shows live activity in the UI,
+	// mirroring what a headless subprocess reports from its stream-json output.
+	replTranscript *replTranscriptForwarder
+
 	mu           sync.Mutex
 	workspaces   map[string]*workspaceState
 	runtimeIndex map[string]Runtime // runtimeID -> Runtime for provider lookups
@@ -195,6 +201,7 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 	d.runUpdateFn = d.runUpdate
 	if cfg.RuntimeExecutor == ExecutorRepl {
 		d.replBroker = newReplBroker(logger, cfg.RuntimeReplLease)
+		d.replTranscript = newReplTranscriptForwarder()
 		logger.Info("runtime executor: repl (tasks run in human-launched REPL sessions via the local broker)", "lease", d.replBroker.lease.String())
 	}
 	return d
@@ -755,6 +762,14 @@ func (d *Daemon) registerRuntimesForWorkspace(ctx context.Context, workspaceID s
 	d.logger.Debug("registering runtimes for workspace", "workspace_id", workspaceID, "agent_count", len(d.cfg.Agents))
 	var runtimes []map[string]string
 	for name, entry := range d.cfg.Agents {
+		// In repl executor mode this machine runs as an interactive Claude Code
+		// session, so it only offers the claude provider — handing every task to
+		// the human REPL session would not make sense for codex/pi/etc. Skipping
+		// them also avoids duplicate rows when a headless daemon (different
+		// daemon_id) already registers those providers on the same machine.
+		if d.cfg.RuntimeExecutor == ExecutorRepl && name != "claude" {
+			continue
+		}
 		version, err := detectAgentVersion(ctx, entry.Path)
 		if err != nil {
 			d.logger.Warn("skip registering runtime", "name", name, "error", err)
@@ -766,7 +781,14 @@ func (d *Daemon) registerRuntimesForWorkspace(ctx context.Context, workspaceID s
 		}
 		d.setAgentVersion(name, version)
 		d.logger.Debug("agent version detected", "name", name, "version", version, "path", entry.Path)
+		// The runtime keeps provider/type "claude" so it inherits Claude's icon,
+		// model list, and thinking config in the UI; only the display name marks
+		// it as the REPL-driven runtime so it reads apart from a headless Claude
+		// runtime (which carries a different daemon_id) in the runtime list.
 		displayName := strings.ToUpper(name[:1]) + name[1:]
+		if d.cfg.RuntimeExecutor == ExecutorRepl && name == "claude" {
+			displayName = "Claude REPL"
+		}
 		if d.cfg.DeviceName != "" {
 			displayName = fmt.Sprintf("%s (%s)", displayName, d.cfg.DeviceName)
 		}

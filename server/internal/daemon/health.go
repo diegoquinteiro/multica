@@ -213,6 +213,7 @@ func (d *Daemon) serveHealth(ctx context.Context, ln net.Listener, startedAt tim
 	mux.HandleFunc("/runtime/next", d.runtimeNextHandler)
 	mux.HandleFunc("/runtime/result", d.runtimeResultHandler)
 	mux.HandleFunc("/runtime/renew", d.runtimeRenewHandler)
+	mux.HandleFunc("/runtime/transcript", d.runtimeTranscriptHandler)
 
 	mux.HandleFunc("/repo/checkout", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -367,11 +368,18 @@ func (d *Daemon) runtimeResultHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Resolve the task id before Report deletes the job, so we can drop the
+	// transcript cursor once the job is over.
+	taskID := d.replBroker.taskIDForJob(req.JobID)
+
 	delivered := d.replBroker.Report(req.JobID, agent.Result{
 		Status: status,
 		Output: req.Summary,
 		Error:  req.Error,
 	})
+	if delivered && taskID != "" && d.replTranscript != nil {
+		d.replTranscript.forget(taskID)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	if !delivered {
@@ -418,4 +426,64 @@ func (d *Daemon) runtimeRenewHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]any{"renewed": true})
+}
+
+// runtimeTranscriptRequest is the body of POST /runtime/transcript, sent by the
+// REPL session's PostToolUse/Stop hook (via `multica runtime transcript`).
+type runtimeTranscriptRequest struct {
+	TaskID         string `json:"task_id"`
+	TranscriptPath string `json:"transcript_path"`
+	SessionID      string `json:"session_id"`
+	Cwd            string `json:"cwd"`
+}
+
+// runtimeTranscriptHandler forwards the transcript lines a REPL session has
+// produced since the last call to the backend as task messages, so the task
+// shows live activity in the UI like a headless one. It is best-effort: any
+// problem (file not ready, backend hiccup) returns 200 with reported:0 so a hook
+// never disrupts the session.
+func (d *Daemon) runtimeTranscriptHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if d.replBroker == nil || d.replTranscript == nil {
+		http.Error(w, "daemon is not running in repl executor mode", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req runtimeTranscriptRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.TaskID) == "" || strings.TrimSpace(req.TranscriptPath) == "" {
+		http.Error(w, "task_id and transcript_path are required", http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	msgs, firstDrain, err := d.replTranscript.drain(req.TaskID, req.TranscriptPath)
+	if err != nil {
+		// Transcript not readable yet (e.g. session just started) — not fatal.
+		d.logger.Debug("repl transcript drain failed", "task_id", req.TaskID, "path", req.TranscriptPath, "error", err)
+		json.NewEncoder(w).Encode(map[string]any{"reported": 0})
+		return
+	}
+
+	ctx := r.Context()
+	if firstDrain && strings.TrimSpace(req.SessionID) != "" {
+		if err := d.client.PinTaskSession(ctx, req.TaskID, req.SessionID, req.Cwd); err != nil {
+			d.logger.Debug("repl transcript pin session failed", "task_id", req.TaskID, "error", err)
+		}
+	}
+	if len(msgs) > 0 {
+		if err := d.client.ReportTaskMessages(ctx, req.TaskID, msgs); err != nil {
+			d.logger.Warn("repl transcript report failed", "task_id", req.TaskID, "count", len(msgs), "error", err)
+			json.NewEncoder(w).Encode(map[string]any{"reported": 0})
+			return
+		}
+	}
+	json.NewEncoder(w).Encode(map[string]any{"reported": len(msgs)})
 }

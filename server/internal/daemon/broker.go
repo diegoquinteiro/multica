@@ -201,6 +201,18 @@ func (b *replBroker) Report(jobID string, res agent.Result) bool {
 	return true
 }
 
+// taskIDForJob returns the Multica task id backing an active job, or "" if the
+// job is unknown. Used to correlate a job id (the broker's opaque handle) back
+// to the task id that transcript/event reporting is keyed on.
+func (b *replBroker) taskIDForJob(jobID string) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if job, ok := b.jobs[jobID]; ok {
+		return job.task.TaskID
+	}
+	return ""
+}
+
 // discard drops a job that will never be reported (its Submit ctx was
 // cancelled), removing it from both the queue and the in-flight map so a REPL
 // session does not later claim a dead job.

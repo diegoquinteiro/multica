@@ -50,7 +50,8 @@ Repeat these steps until the user asks you to stop:
 
    ```json
    {"job": {"job_id": "job-3", "task_id": "...", "cwd": "/abs/workdir",
-            "prompt": "<the full task brief>", "thread_name": "..."}}
+            "prompt": "<the full task brief>", "model": "claude-...",
+            "thread_name": "..."}}
    ```
 
    - `cd` into `cwd` — the daemon already prepared the repo checkout, skills,
@@ -60,21 +61,30 @@ Repeat these steps until the user asks you to stop:
      (this is what lets `squad activity`, `repo checkout`, and other
      agent-scoped commands work — outside `cwd` they fall back to your own login
      and may be refused).
-   - Treat `prompt` as your task instructions and carry them out fully with your
-     native tools, exactly as you would a normal Multica task. The prompt tells
-     you which issue to read and what to do; follow it, including posting any
-     result comment or opening a PR it asks for.
-   - **Keep the lease alive on long work.** A claimed task has a lease (default
-     30 min). If you neither report nor renew within it, the daemon assumes this
-     session died and re-enqueues the task for another session — which would run
-     it twice. For any task that may take a while, run `multica runtime renew
-     <job_id>` periodically (e.g. before each long build/test step):
 
-     ```bash
-     multica runtime renew <job_id>
-     ```
+3. **Run the task in a sub-agent at the agent's model.** The job's `model` is the
+   model configured for the assigned agent. Honor it by running the work in a
+   sub-agent (the Agent tool) with `model` set from it, instead of in this loop's
+   own model:
 
-3. **Report the result**, passing back the `job_id` from step 2:
+   - Map `model` → tier: contains `haiku` → `haiku`, `sonnet` → `sonnet`,
+     `opus` → `opus`, `fable` → `fable`. If `model` is empty or unrecognized,
+     omit `model` so the sub-agent inherits this session's.
+   - Spawn **one** sub-agent, run from `cwd`, whose prompt is the job's `prompt`
+     **verbatim**. Also tell the sub-agent: it is acting as the assigned Multica
+     agent; run every `multica` command from `cwd`; and on long work call
+     `multica runtime renew <job_id>` periodically (the lease is ~30 min — if
+     nothing renews or reports within it, the daemon re-enqueues the task and it
+     runs twice).
+   - The sub-agent carries out the task fully — reads the issue and posts the
+     result comment / opens the PR the prompt asks for. Its final message is the
+     outcome you report in step 4.
+
+   Why a sub-agent: it lets each task run at its agent's configured model while
+   this loop stays on your default model. The sub-agent's activity still streams
+   to the Multica UI (see *Live activity*).
+
+4. **Report the result**, passing back the `job_id` from step 2:
 
    ```bash
    multica runtime result <job_id> --status completed --summary "One-line outcome"
@@ -86,7 +96,16 @@ Repeat these steps until the user asks you to stop:
    substitute for the issue comment the prompt asked you to post. Reporting the
    result also clears the job's credential from `cwd`.
 
-4. Go back to step 1 for the next task.
+5. Go back to step 1 for the next task.
+
+## Live activity (automatic)
+
+While a job runs, your session's tool calls and messages — **including the
+sub-agent's** — are streamed to the task's activity feed in the Multica UI, the
+same way a headless run reports. This is automatic: `multica runtime repl`
+installs Claude Code hooks that forward the session transcript through the
+daemon, so you never call anything for it. Just keep working inside `cwd` so the
+hook attributes the activity to the right task.
 
 ## Resilience (watchdog)
 
