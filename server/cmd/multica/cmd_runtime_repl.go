@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -69,11 +70,19 @@ var runtimeRenewCmd = &cobra.Command{
 	RunE:  runRuntimeRenew,
 }
 
+var runtimeTranscriptCmd = &cobra.Command{
+	Use:    "transcript",
+	Short:  "Forward this REPL session's transcript to the task (invoked by a Claude Code hook, reads the hook JSON on stdin)",
+	Hidden: true,
+	RunE:   runRuntimeTranscript,
+}
+
 func init() {
 	runtimeCmd.AddCommand(runtimeReplCmd)
 	runtimeCmd.AddCommand(runtimeNextCmd)
 	runtimeCmd.AddCommand(runtimeResultCmd)
 	runtimeCmd.AddCommand(runtimeRenewCmd)
+	runtimeCmd.AddCommand(runtimeTranscriptCmd)
 
 	runtimeReplCmd.Flags().Bool("skip-skill-install", false, "Do not (re)install the multica-repl-runtime skill into ~/.claude/skills")
 
@@ -139,6 +148,17 @@ func findJobAuthFile() string {
 	if err != nil {
 		return ""
 	}
+	return findJobAuthFileFrom(dir)
+}
+
+// findJobAuthFileFrom walks up from dir looking for the nearest
+// .multica/job-auth.json. Used when the starting directory is known explicitly
+// (e.g. the cwd carried in a Claude Code hook payload, which may differ from the
+// hook process's own working directory).
+func findJobAuthFileFrom(dir string) string {
+	if dir == "" {
+		return ""
+	}
 	for {
 		candidate := filepath.Join(dir, jobAuthRelPath)
 		if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
@@ -154,8 +174,17 @@ func findJobAuthFile() string {
 
 // loadJobAuth reads the nearest job-auth file, or returns a zero value when
 // there is none or it cannot be parsed (callers then fall back to env/profile).
-func loadJobAuth() jobAuth {
-	path := findJobAuthFile()
+func loadJobAuth() jobAuth { return loadJobAuthFrom("") }
+
+// loadJobAuthFrom reads the nearest job-auth file starting at dir (empty = the
+// process working directory), returning a zero value when there is none.
+func loadJobAuthFrom(dir string) jobAuth {
+	var path string
+	if dir == "" {
+		path = findJobAuthFile()
+	} else {
+		path = findJobAuthFileFrom(dir)
+	}
 	if path == "" {
 		return jobAuth{}
 	}
@@ -188,6 +217,67 @@ func removeJobAuth() {
 	}
 }
 
+// --- runtime transcript (Claude Code hook) ---
+
+// claudeHookPayload is the subset of the JSON a Claude Code hook delivers on
+// stdin that we need to forward a REPL session's activity.
+type claudeHookPayload struct {
+	SessionID      string `json:"session_id"`
+	TranscriptPath string `json:"transcript_path"`
+	Cwd            string `json:"cwd"`
+	HookEventName  string `json:"hook_event_name"`
+}
+
+// runRuntimeTranscript is the target of the REPL session's PostToolUse/Stop
+// hooks. It reads the hook payload from stdin, finds the current job's
+// credential (scoped to the hook's cwd), and pings the local daemon to forward
+// the transcript delta as task messages — so the task shows live activity in the
+// Multica UI like a headless one. It is strictly best-effort: a hook must never
+// fail or block the interactive session, so every error path returns nil.
+func runRuntimeTranscript(cmd *cobra.Command, _ []string) error {
+	data, err := io.ReadAll(os.Stdin)
+	if err != nil || len(data) == 0 {
+		return nil
+	}
+	var hook claudeHookPayload
+	if err := json.Unmarshal(data, &hook); err != nil {
+		return nil
+	}
+	if strings.TrimSpace(hook.TranscriptPath) == "" {
+		return nil
+	}
+
+	// The credential lives in the job's workdir; the skill cd's there, and the
+	// hook payload reports that cwd. No job-auth → an idle session (no task) → no-op.
+	ja := loadJobAuthFrom(hook.Cwd)
+	if strings.TrimSpace(ja.TaskID) == "" {
+		return nil
+	}
+
+	port := ja.DaemonPort
+	if port <= 0 {
+		port = daemonLoopbackPort(cmd)
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"task_id":         ja.TaskID,
+		"transcript_path": hook.TranscriptPath,
+		"session_id":      hook.SessionID,
+		"cwd":             hook.Cwd,
+	})
+	if err != nil {
+		return nil
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	url := fmt.Sprintf("http://127.0.0.1:%d/runtime/transcript", port)
+	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+	if err == nil {
+		resp.Body.Close()
+	}
+	return nil
+}
+
 // --- runtime repl ---
 
 func runRuntimeRepl(cmd *cobra.Command, _ []string) error {
@@ -198,6 +288,15 @@ func runRuntimeRepl(cmd *cobra.Command, _ []string) error {
 			return fmt.Errorf("install %s skill: %w", replSkillName, err)
 		}
 		fmt.Fprintf(os.Stderr, "Installed %s skill → %s\n", replSkillName, dest)
+
+		// Install the transcript-forwarding hooks so a REPL session's activity
+		// streams to the Multica UI live. Best-effort: a hook-install failure must
+		// not stop the runtime, so we warn and continue.
+		if path, err := ensureReplHooks(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not install transcript hooks (%v); live UI activity will be unavailable\n", err)
+		} else if path != "" {
+			fmt.Fprintf(os.Stderr, "Ensured transcript-forwarding hooks → %s\n", path)
+		}
 	}
 
 	fmt.Fprintln(os.Stderr, "Starting daemon in repl executor mode (foreground).")
@@ -206,6 +305,100 @@ func runRuntimeRepl(cmd *cobra.Command, _ []string) error {
 	fmt.Fprintln(os.Stderr, "sessions to process tasks in parallel (one task per session). Ctrl-C to stop.")
 
 	return startDaemonForeground(cmd, "repl")
+}
+
+// ensureReplHooks merges the transcript-forwarding hooks into the user's
+// ~/.claude/settings.json so any `claude` session running a REPL job streams its
+// activity to the Multica UI. PostToolUse fires after each tool call and Stop at
+// the end of each turn; both run `<this binary> runtime transcript`, which is a
+// no-op outside a repl job. The merge is idempotent (it won't duplicate the
+// command) and aborts rather than clobbering an unparseable settings file.
+// Returns the settings path, or "" when nothing needed changing.
+func ensureReplHooks() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home directory: %w", err)
+	}
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+
+	root := map[string]any{}
+	if data, err := os.ReadFile(settingsPath); err == nil {
+		if len(bytes.TrimSpace(data)) > 0 {
+			if err := json.Unmarshal(data, &root); err != nil {
+				// Don't risk overwriting a user's settings we can't parse.
+				return "", fmt.Errorf("parse %s: %w", settingsPath, err)
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("read %s: %w", settingsPath, err)
+	}
+
+	exe, err := os.Executable()
+	if err != nil || strings.TrimSpace(exe) == "" {
+		exe = "multica"
+	}
+	command := exe + " runtime transcript"
+
+	hooks, _ := root["hooks"].(map[string]any)
+	if hooks == nil {
+		hooks = map[string]any{}
+	}
+
+	changed := false
+	if ensureHookCommand(hooks, "PostToolUse", "*", command) {
+		changed = true
+	}
+	if ensureHookCommand(hooks, "Stop", "", command) {
+		changed = true
+	}
+	if !changed {
+		return "", nil
+	}
+
+	root["hooks"] = hooks
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(settingsPath, append(out, '\n'), 0o644); err != nil {
+		return "", err
+	}
+	return settingsPath, nil
+}
+
+// ensureHookCommand adds a {type:command, command} hook under the given event in
+// the Claude Code hooks map if that exact command is not already present.
+// matcher is the tool matcher for events that support one (e.g. PostToolUse);
+// pass "" for events that don't (e.g. Stop). Returns whether it changed hooks.
+func ensureHookCommand(hooks map[string]any, event, matcher, command string) bool {
+	existing, _ := hooks[event].([]any)
+	for _, group := range existing {
+		gm, ok := group.(map[string]any)
+		if !ok {
+			continue
+		}
+		entries, _ := gm["hooks"].([]any)
+		for _, entry := range entries {
+			em, ok := entry.(map[string]any)
+			if !ok {
+				continue
+			}
+			if c, _ := em["command"].(string); c == command {
+				return false // already installed
+			}
+		}
+	}
+	group := map[string]any{
+		"hooks": []any{map[string]any{"type": "command", "command": command}},
+	}
+	if matcher != "" {
+		group["matcher"] = matcher
+	}
+	hooks[event] = append(existing, group)
+	return true
 }
 
 // installReplSkill writes the embedded multica-repl-runtime skill into the

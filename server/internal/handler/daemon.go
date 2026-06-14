@@ -177,11 +177,10 @@ type DaemonRegisterRequest struct {
 	CLIVersion      string   `json:"cli_version"` // multica CLI version
 	LaunchedBy      string   `json:"launched_by"` // "desktop" when spawned by the Electron app
 	Runtimes        []struct {
-		Name     string `json:"name"`
-		Type     string `json:"type"`
-		Version  string `json:"version"` // agent CLI version (claude/codex)
-		Status   string `json:"status"`
-		Executor string `json:"executor"` // "subprocess" (default) or "repl"
+		Name    string `json:"name"`
+		Type    string `json:"type"`
+		Version string `json:"version"` // agent CLI version (claude/codex)
+		Status  string `json:"status"`
 	} `json:"runtimes"`
 }
 
@@ -328,12 +327,6 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 		if runtime.Status == "offline" {
 			status = "offline"
 		}
-		// Per-daemon executor mode; default to subprocess for older daemons
-		// that don't send the field, and reject any unexpected value.
-		executor := strings.TrimSpace(runtime.Executor)
-		if executor != "repl" {
-			executor = "subprocess"
-		}
 		metadata, _ := json.Marshal(map[string]any{
 			"version":     runtime.Version,
 			"cli_version": req.CLIVersion,
@@ -350,7 +343,6 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 			DeviceInfo:  deviceInfo,
 			Metadata:    metadata,
 			OwnerID:     ownerID,
-			Executor:    executor,
 		})
 		if err != nil {
 			obsmetrics.RecordEvent(h.Analytics, h.Metrics, analytics.RuntimeFailed(
@@ -381,7 +373,6 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 			UpdatedAt:      row.UpdatedAt,
 			OwnerID:        row.OwnerID,
 			LegacyDaemonID: row.LegacyDaemonID,
-			Executor:       row.Executor,
 		}
 
 		// Inserted is false for normal daemon reconnects/upserts, so

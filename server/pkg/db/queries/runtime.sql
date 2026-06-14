@@ -43,9 +43,8 @@ INSERT INTO agent_runtime (
     device_info,
     metadata,
     owner_id,
-    executor,
     last_seen_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
 ON CONFLICT (workspace_id, daemon_id, provider)
 DO UPDATE SET
     name = EXCLUDED.name,
@@ -54,7 +53,6 @@ DO UPDATE SET
     device_info = EXCLUDED.device_info,
     metadata = EXCLUDED.metadata,
     owner_id = COALESCE(EXCLUDED.owner_id, agent_runtime.owner_id),
-    executor = EXCLUDED.executor,
     last_seen_at = now(),
     updated_at = now()
 RETURNING *, (xmax = 0) AS inserted;
