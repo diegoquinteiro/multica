@@ -5,6 +5,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -285,6 +286,13 @@ func runRuntimeNext(cmd *cobra.Command, _ []string) error {
 				return nil
 			}
 			if block {
+				if isPermanentNextError(err) {
+					// Not a transient hiccup: the daemon is not in repl mode
+					// (503) or rejected the request (4xx). Retrying would loop
+					// forever and never hand the error back, so surface it and
+					// let the session stop with a clear message.
+					return err
+				}
 				// The daemon may be restarting; back off briefly and retry
 				// instead of ending the session's loop on a transient error.
 				fmt.Fprintf(os.Stderr, "runtime next: %v; retrying in 2s\n", err)
@@ -334,7 +342,17 @@ func pollRuntimeNext(ctx context.Context, port, wait int) (*runtimeNextResult, e
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("runtime next failed (%d): %s", resp.StatusCode, string(body))
+		err := fmt.Errorf("runtime next failed (%d): %s", resp.StatusCode, string(body))
+		// A 503 (daemon not in repl executor mode) or any 4xx (bad request /
+		// auth / unknown route) will not change on retry — it is a permanent
+		// misconfiguration. Mark it so --block surfaces it and stops instead of
+		// spinning forever. Other 5xx are treated as transient (a daemon that is
+		// momentarily unhealthy/restarting), like a connection error.
+		if resp.StatusCode == http.StatusServiceUnavailable ||
+			(resp.StatusCode >= 400 && resp.StatusCode < 500) {
+			return nil, &permanentNextError{err}
+		}
+		return nil, err
 	}
 
 	var result runtimeNextResult
@@ -342,6 +360,22 @@ func pollRuntimeNext(ctx context.Context, port, wait int) (*runtimeNextResult, e
 		return nil, fmt.Errorf("parse daemon response: %w", err)
 	}
 	return &result, nil
+}
+
+// permanentNextError marks a /runtime/next failure that retrying cannot fix
+// (the daemon is not in repl executor mode, or the request was rejected) — as
+// opposed to a transient connection/5xx error during a daemon restart. In
+// --block mode transient errors are retried, but a permanent one ends the loop
+// so the failure reaches the caller instead of looping silently.
+type permanentNextError struct{ err error }
+
+func (e *permanentNextError) Error() string { return e.err.Error() }
+func (e *permanentNextError) Unwrap() error { return e.err }
+
+// isPermanentNextError reports whether err is (or wraps) a permanentNextError.
+func isPermanentNextError(err error) bool {
+	var p *permanentNextError
+	return errors.As(err, &p)
 }
 
 // --- runtime result ---

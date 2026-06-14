@@ -1,12 +1,84 @@
 package main
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/multica-ai/multica/server/internal/cli"
 )
+
+// portFromURL extracts the numeric port from an httptest server URL.
+func portFromURL(t *testing.T, raw string) int {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse url %q: %v", raw, err)
+	}
+	p, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatalf("parse port from %q: %v", raw, err)
+	}
+	return p
+}
+
+// TestPollRuntimeNextClassifiesErrors verifies which /runtime/next failures are
+// permanent (must end a --block loop) vs transient (worth retrying). 503 (daemon
+// not in repl mode) and any 4xx are permanent; other 5xx are transient.
+func TestPollRuntimeNextClassifiesErrors(t *testing.T) {
+	cases := []struct {
+		name          string
+		status        int
+		wantPermanent bool
+	}{
+		{"503 not-repl-mode is permanent", http.StatusServiceUnavailable, true},
+		{"400 bad request is permanent", http.StatusBadRequest, true},
+		{"401 unauthorized is permanent", http.StatusUnauthorized, true},
+		{"403 forbidden is permanent", http.StatusForbidden, true},
+		{"404 not found is permanent", http.StatusNotFound, true},
+		{"500 is transient", http.StatusInternalServerError, false},
+		{"502 is transient", http.StatusBadGateway, false},
+		{"504 is transient", http.StatusGatewayTimeout, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "boom", tc.status)
+			}))
+			defer srv.Close()
+
+			_, err := pollRuntimeNext(context.Background(), portFromURL(t, srv.URL), 0)
+			if err == nil {
+				t.Fatalf("expected an error for status %d", tc.status)
+			}
+			if got := isPermanentNextError(err); got != tc.wantPermanent {
+				t.Fatalf("isPermanentNextError() = %v for status %d, want %v", got, tc.status, tc.wantPermanent)
+			}
+		})
+	}
+}
+
+// TestPollRuntimeNextConnectionErrorIsTransient verifies a refused connection
+// (the daemon down/restarting) is transient — so --block keeps retrying rather
+// than aborting the runtime.
+func TestPollRuntimeNextConnectionErrorIsTransient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	port := portFromURL(t, srv.URL)
+	srv.Close() // nothing listens on `port` now → connection refused
+
+	_, err := pollRuntimeNext(context.Background(), port, 0)
+	if err == nil {
+		t.Fatal("expected a connection error")
+	}
+	if isPermanentNextError(err) {
+		t.Fatal("a connection error must be transient, not permanent")
+	}
+}
 
 // writeTestJobAuth seeds a job-auth file under dir/.multica/job-auth.json.
 func writeTestJobAuth(t *testing.T, dir string, ja jobAuth) {
