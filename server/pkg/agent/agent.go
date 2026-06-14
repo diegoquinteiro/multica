@@ -24,6 +24,11 @@ type Backend interface {
 type ExecOptions struct {
 	Cwd   string
 	Model string
+	// TaskID is the Multica task id this execution serves. Most backends ignore
+	// it — they communicate results through the Session channels, not a task id.
+	// The repl backend carries it into the broker so logs and the REPL-facing
+	// handoff can name the task being worked on.
+	TaskID string
 	// SystemPrompt is consumed only by providers that can pass or safely inline
 	// developer/system instructions. Hermes ACP intentionally ignores it and
 	// relies on cwd-scoped context files such as AGENTS.md instead.
@@ -130,6 +135,33 @@ type Config struct {
 	ExecutablePath string            // path to CLI binary (claude, codebuddy, codex, copilot, opencode, openclaw, hermes, gemini, pi, cursor, kimi, kiro-cli, agy)
 	Env            map[string]string // extra environment variables
 	Logger         *slog.Logger
+	// ReplBroker is consumed only by the "repl" backend. Instead of spawning a
+	// subprocess, that backend hands the prepared task off to this broker and
+	// waits for a human-driven Claude Code REPL session to run it and report a
+	// result. Nil for every other backend.
+	ReplBroker ReplBroker
+}
+
+// ReplTask is the prepared unit of work the repl backend hands to the broker.
+// It mirrors what the daemon would otherwise feed to `claude -p`: the workdir
+// the environment was prepared in, the full prompt, and a couple of display
+// hints. The work itself is performed by a human-launched REPL session, not by
+// a subprocess the daemon spawns.
+type ReplTask struct {
+	TaskID     string
+	Cwd        string
+	Prompt     string
+	Model      string
+	ThreadName string
+}
+
+// ReplBroker is the daemon-side handoff the repl backend depends on. The daemon
+// implements it (see internal/daemon/broker.go); the agent package only needs
+// the contract so the backend stays free of a daemon import. Submit enqueues a
+// task for an attached REPL session and blocks until that session reports a
+// result or ctx is cancelled.
+type ReplBroker interface {
+	Submit(ctx context.Context, task ReplTask) (Result, error)
 }
 
 // New creates a Backend for the given agent type.
@@ -166,8 +198,10 @@ func New(agentType string, cfg Config) (Backend, error) {
 		return &kiroBackend{cfg: cfg}, nil
 	case "antigravity":
 		return &antigravityBackend{cfg: cfg}, nil
+	case "repl":
+		return &replBackend{cfg: cfg}, nil
 	default:
-		return nil, fmt.Errorf("unknown agent type: %q (supported: claude, codebuddy, codex, copilot, opencode, openclaw, hermes, gemini, pi, cursor, kimi, kiro, antigravity)", agentType)
+		return nil, fmt.Errorf("unknown agent type: %q (supported: claude, codebuddy, codex, copilot, opencode, openclaw, hermes, gemini, pi, cursor, kimi, kiro, antigravity, repl)", agentType)
 	}
 }
 
@@ -196,6 +230,7 @@ var launchHeaders = map[string]string{
 	"openclaw":    "openclaw agent (json)",
 	"opencode":    "opencode run (json)",
 	"pi":          "pi (json mode)",
+	"repl":        "claude (interactive REPL via broker)",
 }
 
 // LaunchHeader returns the user-visible launch skeleton for agentType, or an

@@ -9,9 +9,12 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/multica-ai/multica/server/internal/daemon/repocache"
+	"github.com/multica-ai/multica/server/pkg/agent"
 )
 
 // HealthResponse is returned by the daemon's local health endpoint.
@@ -49,6 +52,44 @@ func (d *Daemon) listenHealth() (net.Listener, error) {
 		return nil, fmt.Errorf("another daemon is already running on %s: %w", addr, err)
 	}
 	return ln, nil
+}
+
+// Long-poll bounds for GET /runtime/next. The REPL session asks for the next
+// task; the broker holds the request open up to the wait window so an idle
+// session does not busy-loop, then returns an empty body so the caller can ask
+// again. The caller may shorten the window with ?wait=<seconds>.
+const (
+	defaultRuntimeNextWait = 25 * time.Second
+	maxRuntimeNextWait     = 60 * time.Second
+)
+
+// runtimeNextResponse is the body of GET /runtime/next. Job is nil when the
+// wait window elapsed with no task to hand out.
+type runtimeNextResponse struct {
+	Job *runtimeJob `json:"job"`
+}
+
+// runtimeJob is the REPL-facing view of a brokered task.
+type runtimeJob struct {
+	JobID      string `json:"job_id"`
+	TaskID     string `json:"task_id,omitempty"`
+	Cwd        string `json:"cwd"`
+	Prompt     string `json:"prompt"`
+	Model      string `json:"model,omitempty"`
+	ThreadName string `json:"thread_name,omitempty"`
+}
+
+// runtimeResultRequest is the body of POST /runtime/result.
+type runtimeResultRequest struct {
+	JobID   string `json:"job_id"`
+	Status  string `json:"status"` // "completed" (default) or "failed"
+	Summary string `json:"summary"`
+	Error   string `json:"error,omitempty"`
+}
+
+// runtimeRenewRequest is the body of POST /runtime/renew.
+type runtimeRenewRequest struct {
+	JobID string `json:"job_id"`
 }
 
 // repoCheckoutRequest is the body of a POST /repo/checkout request.
@@ -139,6 +180,10 @@ func (d *Daemon) serveHealth(ctx context.Context, ln net.Listener, startedAt tim
 	mux.HandleFunc("/health", d.healthHandler(startedAt))
 	mux.HandleFunc("/shutdown", d.shutdownHandler())
 
+	mux.HandleFunc("/runtime/next", d.runtimeNextHandler)
+	mux.HandleFunc("/runtime/result", d.runtimeResultHandler)
+	mux.HandleFunc("/runtime/renew", d.runtimeRenewHandler)
+
 	mux.HandleFunc("/repo/checkout", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -208,4 +253,129 @@ func (d *Daemon) serveHealth(ctx context.Context, ln net.Listener, startedAt tim
 	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 		d.logger.Warn("health server error", "error", err)
 	}
+}
+
+// runtimeNextHandler long-polls the broker for the next task and returns it to a
+// REPL session. Only meaningful when the daemon runs with --executor repl.
+func (d *Daemon) runtimeNextHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if d.replBroker == nil {
+		http.Error(w, "daemon is not running in repl executor mode (start it with --executor repl or `multica runtime repl`)", http.StatusServiceUnavailable)
+		return
+	}
+
+	wait := defaultRuntimeNextWait
+	if v := strings.TrimSpace(r.URL.Query().Get("wait")); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+			wait = time.Duration(secs) * time.Second
+		}
+	}
+	if wait > maxRuntimeNextWait {
+		wait = maxRuntimeNextWait
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), wait)
+	defer cancel()
+
+	job, ok := d.replBroker.Next(ctx)
+	w.Header().Set("Content-Type", "application/json")
+	if !ok {
+		json.NewEncoder(w).Encode(runtimeNextResponse{Job: nil})
+		return
+	}
+	json.NewEncoder(w).Encode(runtimeNextResponse{Job: &runtimeJob{
+		JobID:      job.id,
+		TaskID:     job.task.TaskID,
+		Cwd:        job.task.Cwd,
+		Prompt:     job.task.Prompt,
+		Model:      job.task.Model,
+		ThreadName: job.task.ThreadName,
+	}})
+}
+
+// runtimeResultHandler accepts a REPL session's result for a brokered job and
+// routes it back to the waiting executor.
+func (d *Daemon) runtimeResultHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if d.replBroker == nil {
+		http.Error(w, "daemon is not running in repl executor mode", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req runtimeResultRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.JobID) == "" {
+		http.Error(w, "job_id is required", http.StatusBadRequest)
+		return
+	}
+
+	status := strings.TrimSpace(req.Status)
+	if status == "" {
+		status = "completed"
+	}
+	if status != "completed" && status != "failed" {
+		http.Error(w, "status must be 'completed' or 'failed'", http.StatusBadRequest)
+		return
+	}
+
+	delivered := d.replBroker.Report(req.JobID, agent.Result{
+		Status: status,
+		Output: req.Summary,
+		Error:  req.Error,
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	if !delivered {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]any{
+			"delivered": false,
+			"message":   "unknown job id (already reported, cancelled, or expired)",
+		})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{"delivered": true})
+}
+
+// runtimeRenewHandler extends the lease on an in-flight job so a live REPL
+// session working a long task is not reclaimed by the broker's reaper.
+func (d *Daemon) runtimeRenewHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if d.replBroker == nil {
+		http.Error(w, "daemon is not running in repl executor mode", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req runtimeRenewRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.JobID) == "" {
+		http.Error(w, "job_id is required", http.StatusBadRequest)
+		return
+	}
+
+	renewed := d.replBroker.Renew(req.JobID)
+	w.Header().Set("Content-Type", "application/json")
+	if !renewed {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]any{
+			"renewed": false,
+			"message": "unknown or no-longer-in-flight job id",
+		})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{"renewed": true})
 }
